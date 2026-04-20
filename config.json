@@ -1,0 +1,39 @@
+{
+  "city": "BEIJING",
+  "months": ["+0", "+1", "+2"],
+  "service_index": 1,
+  "show_browser": false,
+  "timeout_seconds": 30,
+  "check_once_max_seconds": 180,
+  "interval_minutes": 1,
+  "booking": {
+    "enabled": false,
+    "date_selection": {
+      "targets": [],
+      "filter_mode": "none",
+      "weights": [],
+      "final_pick": "earliest"
+    },
+    "time_selection": {
+      "filter_mode": "none",
+      "final_pick": "latest"
+    },
+    "applicant": {
+      "last_name": "SAN",
+      "first_name": "TAN",
+      "date_of_birth": "2000-01-01",
+      "telephone": "1393000",
+      "email": "e@gmail.com",
+      "citizenship": "SINGAPORE",
+      "birth_country": "SINGAPORE",
+      "sex": "M",
+      "passport_number": "E15645678",
+      "non_applicant_names": [
+        "LI SI",
+        "WANG WU",
+        "WANG LU",
+        "WANG ZU"
+      ]
+    }
+  }
+}
