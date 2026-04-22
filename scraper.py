@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import datetime as dt
 import atexit
@@ -89,7 +89,6 @@ LOG_PATH_ENV = "EVISAFORMS_LOG_PATH"
 LOG_OWNER_PID_ENV = "EVISAFORMS_LOG_OWNER_PID"
 LOG_SESSION_ENV = "EVISAFORMS_LOG_SESSION"
 CITY_CACHE_TTL_SECONDS = 24 * 60 * 60
-DEFAULT_PAGE_STATE_TIMEOUT_FLOOR_SECONDS = 90
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 MAX_RETRY_BACKOFF_SECONDS = 60.0
 RETRY_BACKOFF_JITTER_RATIO = 0.25
@@ -116,6 +115,13 @@ HTML_SELECT_RE = re.compile(
 )
 HTML_SELECTED_OPTION_RE = re.compile(
     r"<option\b(?=[^>]*selected)[^>]*value=[\"']?([^\"' >]+)",
+    re.IGNORECASE | re.DOTALL,
+)
+SERVICE_INPUT_ROW_RE = re.compile(
+    r"<tr\b[^>]*>.*?"
+    r"<input\b[^>]*type\s*=\s*(?:['\"])?(?P<input_type>radio|checkbox)(?:['\"])?[^>]*"
+    r"name\s*=\s*(?:['\"])?(?P<input_name>chkservice|chkservicespec)(?:['\"])?[^>]*>"
+    r".*?</td>\s*<td\b[^>]*>(?P<label>.*?)</td>.*?</tr>",
     re.IGNORECASE | re.DOTALL,
 )
 GENERIC_SELECT_RE_TEMPLATE = r"<select\b[^>]*name=[\"']{name}[\"'][^>]*>(?P<body>.*?)</select>"
@@ -370,11 +376,12 @@ class PageSnapshot:
 
 @dataclass(frozen=True)
 class ServiceSelectionSnapshot:
-    radio_inputs: Any
+    service_inputs: Any
     service_labels: Tuple[str, ...]
+    selection_mode: str
 
     @property
-    def radio_count(self) -> int:
+    def input_count(self) -> int:
         return len(self.service_labels)
 
 
@@ -388,7 +395,8 @@ class RuntimeConfigValues:
     calendar_request_delay_seconds: float
     browser_channel: Optional[str]
     city_value: str
-    service_index: int
+    service_index: Optional[int]
+    service_indexs: Tuple[int, ...]
     booking_config: BookingConfig
     show_browser: bool
     user_agent: str
@@ -854,6 +862,23 @@ def choose_preferred_option_values(
     return dom_unique if chosen_source == "DOM" else regex_unique
 
 
+def extract_service_options_from_html(page_html: str) -> Tuple[Tuple[str, ...], str]:
+    labels: List[str] = []
+    input_types: List[str] = []
+    for match in SERVICE_INPUT_ROW_RE.finditer(page_html):
+        label = strip_html(match.group("label"))
+        if not label:
+            continue
+        labels.append(label)
+        input_types.append(normalize_whitespace(match.group("input_type")).lower())
+
+    if not labels:
+        return (), "radio"
+
+    selection_mode = "checkbox" if any(input_type == "checkbox" for input_type in input_types) else "radio"
+    return tuple(labels), selection_mode
+
+
 def load_city_options_from_page(page: Page, timeout_seconds: int) -> List[Location]:
     wait_for_city_options(page, timeout_seconds)
     dom_options = extract_city_options_from_dom(page)
@@ -1152,7 +1177,7 @@ def resolve_location_from_city(
 
     city_list = ", ".join(f"{option.city} ({option.post_code})" for option in options)
     raise RuntimeError(
-        f"没有找到城市 {city}, 请检查拼写。当前解析到的地点: {city_list}"
+        f"没有找到城市 {city}, 请检查拼写. 当前解析到的地点: {city_list}"
     )
 
 
@@ -1379,8 +1404,26 @@ def parse_runtime_config_values(config: Dict[str, Any]) -> RuntimeConfigValues:
 
     service_index_raw = config.get("service_index")
     service_index = int(service_index_raw) if service_index_raw is not None else None
-    if service_index is None:
-        raise RuntimeError("config.json 需要设置 service_index")
+
+    service_indexs_raw = config.get("service_indexs")
+    service_indexs: Tuple[int, ...] = ()
+    if service_indexs_raw is not None:
+        if not isinstance(service_indexs_raw, list):
+            raise RuntimeError("config.json 中的 service_indexs 必须是数组")
+        parsed_service_indexs: List[int] = []
+        for raw_item in service_indexs_raw:
+            index_value = int(raw_item)
+            if index_value <= 0:
+                raise RuntimeError("config.json 中的 service_indexs 元素必须大于 0")
+            parsed_service_indexs.append(index_value)
+        service_indexs = tuple(parsed_service_indexs)
+
+    if service_index is not None and service_indexs:
+        raise RuntimeError("config.json 中 service_index 和 service_indexs 不能同时配置")
+    if service_index is None and not service_indexs:
+        raise RuntimeError("config.json 需要配置 service_index 或 service_indexs")
+    if service_index is not None and service_index <= 0:
+        raise RuntimeError("config.json 中的 service_index 必须大于 0")
 
     booking_config = parse_booking_config(booking_raw)
     if booking_config.enabled and booking_config.applicant_error:
@@ -1396,6 +1439,7 @@ def parse_runtime_config_values(config: Dict[str, Any]) -> RuntimeConfigValues:
         browser_channel="chrome",
         city_value=city_value,
         service_index=service_index,
+        service_indexs=service_indexs,
         booking_config=booking_config,
         show_browser=coerce_bool(config.get("show_browser"), default=False),
         user_agent=DEFAULT_USER_AGENT,
@@ -1409,6 +1453,7 @@ class PassportAppointmentScraper:
         months: Sequence[str],
         interval_minutes: int,
         service_index: Optional[int],
+        service_indexs: Sequence[int],
         headless: bool,
         timeout_seconds: int,
         check_once_max_seconds: int,
@@ -1423,6 +1468,7 @@ class PassportAppointmentScraper:
         self._resolved_target_months: Tuple[MonthTarget, ...] = ()
         self.interval_minutes = interval_minutes
         self.service_index = service_index
+        self.service_indexs = tuple(service_indexs)
         self.headless = headless
         self.timeout_seconds = timeout_seconds
         self.check_once_max_seconds = check_once_max_seconds
@@ -1451,8 +1497,8 @@ class PassportAppointmentScraper:
         self._check_once_started_at: Optional[float] = None
         self._check_once_deadline_at: Optional[float] = None
         self.page_state_timeout_seconds = max(
-            DEFAULT_PAGE_STATE_TIMEOUT_FLOOR_SECONDS,
-            self.timeout_seconds * 2,
+            DEFAULT_TIMEOUT_SECONDS,
+            self.timeout_seconds,
         )
 
     def default_calendar_url(
@@ -1491,6 +1537,15 @@ class PassportAppointmentScraper:
                 label = self._cached_service_labels[index]
                 if label:
                     return label
+        if self.service_indexs and self._cached_service_labels:
+            labels = [
+                self._cached_service_labels[index - 1]
+                for index in self.service_indexs
+                if 1 <= index <= len(self._cached_service_labels)
+                and self._cached_service_labels[index - 1]
+            ]
+            if labels:
+                return ", ".join(labels)
         return self._cached_selected_service_label
 
     def cache_service_labels(self, labels: Sequence[str]) -> None:
@@ -1502,6 +1557,12 @@ class PassportAppointmentScraper:
         current_label = self.current_cached_service_label()
         if current_label:
             self._cached_selected_service_label = current_label
+
+    def get_service_selection_inputs(self, page: Page) -> Any:
+        service_inputs = page.locator("input[name='chkservice'], input[name='chkservicespec']")
+        if service_inputs.count() > 0:
+            return service_inputs
+        return page.locator("input[type='radio'], input[type='checkbox']")
 
     def merge_request_context_with_cache(
         self,
@@ -1661,28 +1722,39 @@ class PassportAppointmentScraper:
         return labels.get(state, state.value)
 
     def build_service_selection_snapshot(self, page: Page) -> ServiceSelectionSnapshot:
-        radio_inputs = page.locator("input[type='radio']")
-        radio_count = radio_inputs.count()
+        service_inputs = self.get_service_selection_inputs(page)
+        service_count = service_inputs.count()
+        regex_labels, regex_selection_mode = extract_service_options_from_html(page.content())
         label_script = """(element) => {
             const row = element.closest('tr');
             const source = row ? row.innerText : (element.parentElement ? element.parentElement.innerText : '');
             return source.replace(/\\s+/g, ' ').trim();
         }"""
         service_labels: List[str] = []
-        for index in range(radio_count):
+        input_types: List[str] = []
+        for index in range(service_count):
             label = ""
             try:
-                label = normalize_whitespace(radio_inputs.nth(index).evaluate(label_script))
+                label = normalize_whitespace(service_inputs.nth(index).evaluate(label_script))
             except Exception:
                 label = ""
+            input_types.append(
+                normalize_whitespace(service_inputs.nth(index).get_attribute("type") or "").lower()
+            )
+            if not label and index < len(regex_labels):
+                label = regex_labels[index]
             if not label and index < len(self._cached_service_labels):
                 label = self._cached_service_labels[index]
             service_labels.append(label or f"Service {index + 1}")
+        if not service_labels and regex_labels:
+            service_labels = list(regex_labels)
         if service_labels:
             self.cache_service_labels(service_labels)
+        selection_mode = "checkbox" if any(input_type == "checkbox" for input_type in input_types) else regex_selection_mode
         return ServiceSelectionSnapshot(
-            radio_inputs=radio_inputs,
+            service_inputs=service_inputs,
             service_labels=tuple(service_labels),
+            selection_mode=selection_mode,
         )
 
     def print_available_services(self, page: Page) -> None:
@@ -1694,12 +1766,28 @@ class PassportAppointmentScraper:
 
         print("\n当前页可用服务:")
         for index, label in enumerate(service_labels, start=1):
-            current_marker = " [当前使用]" if self.service_index == index else ""
+            if service_snapshot.selection_mode == "checkbox":
+                current_marker = " [当前使用]" if index in self.service_indexs else ""
+            else:
+                current_marker = " [当前使用]" if self.service_index == index else ""
             print(f"{index}. {label}{current_marker}")
 
-        if self.service_index is None:
+        if service_snapshot.selection_mode == "checkbox":
+            if not self.service_indexs:
+                print("当前使用的服务: 未配置 service_indexs")
+            else:
+                selected_labels = [
+                    f"{index}. {service_labels[index - 1]}"
+                    for index in self.service_indexs
+                    if 1 <= index <= service_snapshot.input_count
+                ]
+                if selected_labels:
+                    print(f"当前使用的服务: {', '.join(selected_labels)}")
+                else:
+                    print(f"当前使用的服务: service_indexs={list(self.service_indexs)} 超出范围")
+        elif self.service_index is None:
             print("当前使用的服务: 未配置 service_index")
-        elif 1 <= self.service_index <= service_snapshot.radio_count:
+        elif 1 <= self.service_index <= service_snapshot.input_count:
             print(f"当前使用的服务: {self.service_index}. {service_labels[self.service_index - 1]}")
         else:
             print(f"当前使用的服务: service_index={self.service_index} 超出范围")
@@ -1869,8 +1957,8 @@ class PassportAppointmentScraper:
         self.update_display_name(page_html)
         csrf_token = extract_csrf_token(page_html)
 
-        if self.service_index is None:
-            raise RuntimeError("config.json 需要设置 service_index")
+        if self.service_index is None and not self.service_indexs:
+            raise RuntimeError("config.json 需要设置 service_index 或 service_indexs")
 
         return self._resolve_service_selection_in_browser(
             page=page,
@@ -1926,7 +2014,7 @@ class PassportAppointmentScraper:
     def wait_for_service_selection_options(self, page: Page) -> None:
         deadline = time.monotonic() + max(3, self.timeout_seconds)
         while time.monotonic() < deadline:
-            if page.locator("input[type='radio']").count() > 0:
+            if self.get_service_selection_inputs(page).count() > 0:
                 return
             if self.has_verification_controls(page):
                 return
@@ -1974,11 +2062,12 @@ class PassportAppointmentScraper:
             page.locator("input[type='button'][value='Back']").count() > 0
             or page.locator("a:has-text('Back')").count() > 0
         )
+        service_selection_inputs = self.get_service_selection_inputs(page)
         has_service_selection = (
             not has_booking_form
             and page.locator("input[name='txtLastName']").count() == 0
             and page.locator("input[name='availTimeSlot']").count() == 0
-            and page.locator("input[type='radio']").count() > 0
+            and service_selection_inputs.count() > 0
             and page.locator("input[type='submit'], button[type='submit']").count() > 0
         )
         has_expired_id_prompt = is_expired_id_page_text(body_text_lower)
@@ -2199,7 +2288,6 @@ class PassportAppointmentScraper:
         context: BrowserContext,
         make_appointment_url: str,
     ) -> CalendarRequestContext:
-        assert self.service_index is not None
         selected_service_label: Optional[str] = None
 
         def try_extract_context_using_cached_values() -> Optional[CalendarRequestContext]:
@@ -2282,29 +2370,68 @@ class PassportAppointmentScraper:
         raise RuntimeError("page state machine exceeded transitions while resolving service selection")
 
     def submit_service_selection_page(self, page: Page) -> str:
-        assert self.service_index is not None
-
         service_snapshot = self.build_service_selection_snapshot(page)
-        if service_snapshot.radio_count == 0:
-            raise RuntimeError("service selection page has no radio inputs")
-        if self.service_index < 1 or self.service_index > service_snapshot.radio_count:
-            raise RuntimeError(
-                f"service_index={self.service_index} is out of range, page only has {service_snapshot.radio_count} options"
-            )
+        if service_snapshot.input_count == 0:
+            raise RuntimeError("service selection page has no selectable service inputs")
 
-        selected_radio = service_snapshot.radio_inputs.nth(self.service_index - 1)
-        service_label = service_snapshot.service_labels[self.service_index - 1]
-        if not service_label:
-            service_label = self.current_cached_service_label() or ""
+        if service_snapshot.selection_mode == "checkbox":
+            if self.service_index is not None:
+                raise RuntimeError("当前服务页为多选 checkbox, 只能配置 service_indexs")
+            if not self.service_indexs:
+                raise RuntimeError("当前服务页为多选 checkbox, 需要配置 service_indexs")
+            invalid_indexes = [
+                index for index in self.service_indexs
+                if index < 1 or index > service_snapshot.input_count
+            ]
+            if invalid_indexes:
+                raise RuntimeError(
+                    f"service_indexs={list(self.service_indexs)} 超出范围, "
+                    f"页面只有 {service_snapshot.input_count} 个选项"
+                )
 
-        self.human_pause(0.2, 0.6)
-        selected_radio.check(force=True)
+            self.human_pause(0.2, 0.6)
+            for index in range(service_snapshot.input_count):
+                checkbox = service_snapshot.service_inputs.nth(index)
+                try:
+                    if checkbox.is_checked():
+                        checkbox.uncheck(force=True)
+                except Exception:
+                    pass
 
-        checkbox_inputs = page.locator("input[type='checkbox']")
-        for index in range(checkbox_inputs.count()):
-            checkbox = checkbox_inputs.nth(index)
-            if checkbox.is_visible() and checkbox.is_enabled():
-                checkbox.check(force=True)
+            selected_labels: List[str] = []
+            for service_index in self.service_indexs:
+                selected_checkbox = service_snapshot.service_inputs.nth(service_index - 1)
+                selected_checkbox.check(force=True)
+                label = service_snapshot.service_labels[service_index - 1]
+                if label:
+                    selected_labels.append(label)
+            service_label = ", ".join(selected_labels) if selected_labels else (self.current_cached_service_label() or "")
+        else:
+            if self.service_index is None:
+                raise RuntimeError("当前服务页为单选 radio, 需要配置 service_index")
+            if self.service_indexs:
+                raise RuntimeError("当前服务页为单选 radio, 只能配置 service_index")
+            if self.service_index < 1 or self.service_index > service_snapshot.input_count:
+                raise RuntimeError(
+                    f"service_index={self.service_index} is out of range, "
+                    f"page only has {service_snapshot.input_count} options"
+                )
+
+            selected_radio = service_snapshot.service_inputs.nth(self.service_index - 1)
+            service_label = service_snapshot.service_labels[self.service_index - 1]
+            if not service_label:
+                service_label = self.current_cached_service_label() or ""
+
+            self.human_pause(0.2, 0.6)
+            selected_radio.check(force=True)
+
+        instruction_checkbox = page.locator("input[name='chkbox01']").first
+        if instruction_checkbox.count() > 0:
+            try:
+                if instruction_checkbox.is_visible() and instruction_checkbox.is_enabled():
+                    instruction_checkbox.check(force=True)
+            except Exception:
+                pass
 
         submit_button = page.locator("input[type='submit'], button[type='submit']").first
         if submit_button.count() == 0:
@@ -3178,10 +3305,10 @@ class PassportAppointmentScraper:
                 if snapshot.state == PageState.RETRY:
                     captcha_retry_count += 1
                     if captcha_retry_count > max_captcha_retries:
-                        print("\n验证码连续失败次数过多, 立即重试")
+                        print("\n连续失败次数过多, 立即重试")
                         return "retry"
 
-                    print(f"\n验证码错误, 返回重试 (第 {captcha_retry_count} 次)")
+                    print(f"\n错误, 返回重试 (第 {captcha_retry_count} 次)")
                     if not self.return_from_retry_page(page):
                         print("\n错误页返回失败, 立即重试")
                         return "retry"
@@ -3407,6 +3534,7 @@ def build_scraper_from_config(config: Dict[str, Any]) -> PassportAppointmentScra
         months=settings.months,
         interval_minutes=settings.interval_minutes,
         service_index=settings.service_index,
+        service_indexs=settings.service_indexs,
         headless=not settings.show_browser,
         timeout_seconds=settings.timeout_seconds,
         check_once_max_seconds=settings.check_once_max_seconds,
