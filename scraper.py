@@ -154,6 +154,8 @@ class TeeStream:
         for stream in self._streams:
             try:
                 stream.write(data)
+                if "\n" in data:
+                    stream.flush()
             except Exception:
                 continue
         return len(data)
@@ -321,6 +323,12 @@ class TimeSelectionConfig:
 
 
 @dataclass(frozen=True)
+class BubbleConfig:
+    enabled: bool
+    password: str
+
+
+@dataclass(frozen=True)
 class ApplicantConfig:
     last_name: str = ""
     first_name: str = ""
@@ -342,6 +350,7 @@ class BookingConfig:
     enabled: bool
     date_selection: DateSelectionConfig
     time_selection: TimeSelectionConfig
+    bubble: BubbleConfig
     applicant: Optional[ApplicantConfig]
     applicant_error: Optional[str]
     artifacts_dir: str
@@ -354,9 +363,13 @@ class BookingConfigError(RuntimeError):
 class PageState(str, Enum):
     EXPIRED_ID = "expired_id"
     BAD_SUBMIT = "bad_submit"
+    BAD_SUBMIT_CHANGE = "bad_submit_change"
     CANCEL_BOOKING = "cancel_booking"
+    CANCEL_SUBMIT = "cancel_submit"
+    APPOINTMENT_CANCEL_QUERY = "appointment_cancel_query"
+    APPOINTMENT_DETAIL = "appointment_detail"
     VERIFICATION = "verification"
-    CITY_SUBMIT = "city_submit"
+    APPOINTMENT_SELECTION = "appointment_selection"
     SERVICE_SELECTION_LOADING = "service_selection_loading"
     SERVICE_SELECTION = "service_selection"
     CALENDAR = "calendar"
@@ -836,7 +849,7 @@ def choose_preferred_locations(dom_options: Sequence[Location], regex_options: S
         "\n提示\n====\n城市列表 DOM/正则完整比较: "
         f"{'一致' if is_consistent else '不一致'}, "
         f"DOM={len(dom_unique)}, Regex={len(regex_unique)}, "
-        f"使用={chosen_source}"
+        f"使用{chosen_source}"
     )
     return dom_unique if chosen_source == "DOM" else regex_unique
 
@@ -857,7 +870,7 @@ def choose_preferred_option_values(
         f"\n提示\n====\n{field_label} DOM/正则完整比较: "
         f"{'一致' if is_consistent else '不一致'}, "
         f"DOM={len(dom_unique)}, Regex={len(regex_unique)}, "
-        f"使用={chosen_source}"
+        f"使用{chosen_source}"
     )
     return dom_unique if chosen_source == "DOM" else regex_unique
 
@@ -1262,6 +1275,14 @@ def parse_time_selection_config(raw_config: Any) -> TimeSelectionConfig:
     )
 
 
+def parse_bubble_config(raw_config: Any) -> BubbleConfig:
+    config = raw_config if isinstance(raw_config, dict) else {}
+    return BubbleConfig(
+        enabled=coerce_bool(config.get("enabled"), default=False),
+        password=str(config.get("password", "") or "").strip(),
+    )
+
+
 def parse_applicant_config(raw_config: Any) -> Tuple[Optional[ApplicantConfig], Optional[str]]:
     if not isinstance(raw_config, dict):
         return ApplicantConfig(), None
@@ -1337,6 +1358,7 @@ def parse_booking_config(raw_config: Any) -> BookingConfig:
         enabled=coerce_bool(config.get("enabled"), default=False),
         date_selection=parse_date_selection_config(config.get("date_selection", {})),
         time_selection=parse_time_selection_config(config.get("time_selection", {})),
+        bubble=parse_bubble_config(config.get("bubble", {})),
         applicant=applicant,
         applicant_error=applicant_error,
         artifacts_dir=BOOKING_ARTIFACTS_DIR,
@@ -1371,7 +1393,7 @@ def parse_runtime_config_values(config: Dict[str, Any]) -> RuntimeConfigValues:
         booking_raw = {}
     if not isinstance(booking_raw, dict):
         raise RuntimeError("config.json 中的 booking 必须是对象")
-    for field_name in ("date_selection", "time_selection", "applicant"):
+    for field_name in ("date_selection", "time_selection", "applicant", "bubble"):
         if field_name in booking_raw and booking_raw[field_name] is not None and not isinstance(
             booking_raw[field_name], dict
         ):
@@ -1426,6 +1448,14 @@ def parse_runtime_config_values(config: Dict[str, Any]) -> RuntimeConfigValues:
         raise RuntimeError("config.json 中的 service_index 必须大于 0")
 
     booking_config = parse_booking_config(booking_raw)
+    if (
+        booking_config.bubble.enabled
+        and booking_config.date_selection.filter_mode not in {"none", "weight"}
+    ):
+        raise RuntimeError(
+            "booking.bubble.enabled 为 true 时, "
+            "booking.date_selection.filter_mode 只能是 none 或 weight"
+        )
     if booking_config.enabled and booking_config.applicant_error:
         raise BookingConfigError(booking_config.applicant_error)
 
@@ -1491,6 +1521,11 @@ class PassportAppointmentScraper:
         self._cached_service_type: Optional[str] = None
         self._cached_citizenship_options: Tuple[str, ...] = ()
         self._cached_birth_country_options: Tuple[str, ...] = ()
+        self.current_appointment_date: Optional[dt.date] = None
+        self.current_appointment_password: str = ""
+        self.bubble_password_checked: bool = False
+        if not self.booking.bubble.password:
+            self.bubble_password_checked = True
         self._last_logged_page_state: Optional[PageState] = None
         self._last_detected_page_key: Optional[Tuple[PageState, str]] = None
         self._page_state_entered_at: Optional[float] = None
@@ -1610,6 +1645,17 @@ class PassportAppointmentScraper:
             "service_type": self._cached_service_type,
         }
 
+    def current_bubble_state_payload(self) -> Dict[str, Any]:
+        return {
+            "current_appointment_date": (
+                self.current_appointment_date.isoformat()
+                if self.current_appointment_date is not None
+                else None
+            ),
+            "current_appointment_password": self.current_appointment_password,
+            "bubble_password_checked": self.bubble_password_checked,
+        }
+
     def apply_context_cache_payload(self, payload: Dict[str, Any]) -> None:
         cookie_header = payload.get("cookie_header")
         csrf_token = payload.get("csrf_token")
@@ -1640,6 +1686,20 @@ class PassportAppointmentScraper:
             self._cached_appointment_type = str(appointment_type)
         if service_type:
             self._cached_service_type = str(service_type)
+
+    def apply_bubble_state_payload(self, payload: Dict[str, Any]) -> None:
+        date_raw = payload.get("current_appointment_date")
+        if date_raw:
+            try:
+                self.current_appointment_date = parse_iso_date(str(date_raw))
+            except Exception:
+                self.current_appointment_date = None
+        else:
+            self.current_appointment_date = None
+
+        password = payload.get("current_appointment_password")
+        self.current_appointment_password = str(password or "")
+        self.bubble_password_checked = bool(payload.get("bubble_password_checked", False))
 
     def current_cached_request_context(self) -> Optional[CalendarRequestContext]:
         if (
@@ -1708,9 +1768,13 @@ class PassportAppointmentScraper:
         labels = {
             PageState.EXPIRED_ID: "过期链接页",
             PageState.BAD_SUBMIT: "错误提交页",
+            PageState.BAD_SUBMIT_CHANGE: "错误提交修改页",
             PageState.CANCEL_BOOKING: "取消预约页",
+            PageState.CANCEL_SUBMIT: "取消预约提交页",
+            PageState.APPOINTMENT_CANCEL_QUERY: "取消预约查询页",
+            PageState.APPOINTMENT_DETAIL: "预约详情页",
             PageState.VERIFICATION: "验证码页",
-            PageState.CITY_SUBMIT: "预约选择页",
+            PageState.APPOINTMENT_SELECTION: "预约选择页",
             PageState.SERVICE_SELECTION_LOADING: "服务选择加载页",
             PageState.SERVICE_SELECTION: "服务选择页",
             PageState.CALENDAR: "日历页",
@@ -1970,7 +2034,7 @@ class PassportAppointmentScraper:
         return normalize_whitespace(page.locator("body").inner_text())
 
     def is_verification_body_text(self, body_text_lower: str) -> bool:
-        return "type the characters as they appear in the picture" in body_text_lower
+        return "type the characters as they appear in the picture" in body_text_lower or "what code is in the image" in body_text_lower
 
     def has_inline_verification_prompt_text(self, body_text_lower: str) -> bool:
         return "retype the code from the picture" in body_text_lower
@@ -1980,6 +2044,296 @@ class PassportAppointmentScraper:
 
     def is_existing_appointment_cancel_text(self, body_text_lower: str) -> bool:
         return "it appears that you already have an appointment scheduled" in body_text_lower
+
+    def is_bubble_enabled(self) -> bool:
+        return (
+            self.booking.enabled
+            and self.booking.bubble.enabled
+            and self.booking.date_selection.filter_mode in {"none", "weight"}
+        )
+
+    def cancel_query_url(self, csrf_token: str) -> str:
+        query = urlencode(
+            {
+                "pc": self.location.post_code,
+                "CSRFToken": csrf_token,
+            }
+        )
+        return urljoin(BASE_ACS_URL, f"make_cancel_main.asp?{query}")
+
+    def appointment_selection_url(self) -> str:
+        return urljoin(
+            BASE_ACS_URL,
+            f"default.asp?appcode=1&postcode={self.location.post_code}",
+        )
+
+    def extract_page_csrf_token(self, page: Page) -> str:
+        query = parse_qs(urlparse(page.url).query)
+        csrf_token = first_query_value(query, "CSRFToken")
+        if csrf_token:
+            return csrf_token
+        return extract_csrf_token(page.content())
+
+    def resolve_verification_pages(self, page: Page, context_label: str) -> PageSnapshot:
+        for _ in range(10):
+            snapshot = self.detect_page_snapshot(page)
+            if snapshot.state != PageState.VERIFICATION:
+                return snapshot
+            if self.handle_verification_page(page) == "retry":
+                raise RuntimeError(f"verification page retries exceeded while {context_label}")
+        raise RuntimeError(f"page state machine exceeded transitions while {context_label}")
+
+    def has_cancel_query_form_fields(self, page: Page) -> bool:
+        if page.locator("input[name='lastName1'], input[name='FirstName1'], input[name='Telephone1'], input[name='Password1']").count() > 0:
+            return True
+        visible_text_input_count = 0
+        inputs = page.locator("input")
+        for input_index in range(inputs.count()):
+            input_box = inputs.nth(input_index)
+            input_type = normalize_whitespace(input_box.get_attribute("type") or "text").lower()
+            if input_type not in {"", "text", "password", "tel"}:
+                continue
+            try:
+                if input_box.is_visible() and input_box.is_enabled():
+                    visible_text_input_count += 1
+            except Exception:
+                continue
+        return visible_text_input_count >= 4
+
+    def wait_for_cancel_query_form(self, page: Page) -> None:
+        deadline = time.monotonic() + max(8, self.timeout_seconds)
+        while time.monotonic() < deadline:
+            snapshot = self.resolve_verification_pages(page, "waiting for cancel query form")
+            if snapshot.state in {PageState.BAD_SUBMIT, PageState.BAD_SUBMIT_CHANGE}:
+                return
+            if self.has_cancel_query_form_fields(page):
+                return
+            page.wait_for_timeout(500)
+
+        try:
+            body_preview = self.extract_body_preview(page.locator("body").inner_text(), limit=500)
+        except Exception:
+            body_preview = ""
+        input_names = []
+        inputs = page.locator("input")
+        for input_index in range(inputs.count()):
+            input_names.append(inputs.nth(input_index).get_attribute("name") or "")
+        raise RuntimeError(
+            "取消预约查询页表单未加载完成或被异常页面替代; "
+            f"URL: {page.url}; input name: {input_names}; 页面内容预览: {body_preview}"
+        )
+
+    def open_cancel_query_page(self, page: Page) -> None:
+        if self._cached_csrf_token:
+            page.goto(
+                self.cancel_query_url(self._cached_csrf_token),
+                wait_until="networkidle",
+                timeout=self.timeout_seconds * 1000,
+            )
+            self.resolve_verification_pages(page, "opening cancel query page")
+            self.wait_for_cancel_query_form(page)
+            return
+
+        page.goto(
+            self.appointment_selection_url(),
+            wait_until="networkidle",
+            timeout=self.timeout_seconds * 1000,
+        )
+        self.resolve_verification_pages(page, "opening appointment selection page")
+
+        csrf_token = self.extract_page_csrf_token(page)
+        self._cached_csrf_token = csrf_token
+        cancel_button = page.locator(
+            "input[value='Cancel Appointment!'], button:has-text('Cancel Appointment!')"
+        ).first
+        if cancel_button.count() > 0:
+            try:
+                with page.expect_navigation(
+                    wait_until="networkidle",
+                    timeout=self.timeout_seconds * 1000,
+                ):
+                    cancel_button.click()
+                self.resolve_verification_pages(page, "opening cancel query page")
+                self.wait_for_cancel_query_form(page)
+                return
+            except Exception:
+                pass
+
+        page.goto(
+            self.cancel_query_url(csrf_token),
+            wait_until="networkidle",
+            timeout=self.timeout_seconds * 1000,
+        )
+        self.resolve_verification_pages(page, "opening cancel query page")
+        self.wait_for_cancel_query_form(page)
+
+    def fill_cancel_query_form(self, page: Page, password: str) -> None:
+        applicant = self.booking.applicant
+        if applicant is None:
+            raise BookingConfigError("booking.applicant 不完整")
+
+        fields = (
+            (("lastName1", "LastName1", "lastName", "LastName"), applicant.last_name),
+            (("FirstName1", "firstName1", "FirstName", "firstName"), applicant.first_name),
+            (("Telephone1", "telephone1", "Telephone", "telephone"), applicant.telephone),
+            (("Password1", "password1", "Password", "password"), password),
+        )
+        missing_indexes: List[int] = []
+        for index, (name_candidates, value) in enumerate(fields):
+            control = None
+            for name in name_candidates:
+                candidate = page.locator(f"input[name='{name}']").first
+                if candidate.count() > 0:
+                    control = candidate
+                    break
+            if control is None:
+                missing_indexes.append(index)
+                continue
+            control.fill(value)
+
+        if not missing_indexes:
+            return
+
+        visible_text_inputs: List[Any] = []
+        inputs = page.locator("input")
+        for input_index in range(inputs.count()):
+            input_box = inputs.nth(input_index)
+            input_type = normalize_whitespace(input_box.get_attribute("type") or "text").lower()
+            if input_type not in {"", "text", "password", "tel"}:
+                continue
+            try:
+                if input_box.is_visible() and input_box.is_enabled():
+                    visible_text_inputs.append(input_box)
+            except Exception:
+                continue
+
+        if len(visible_text_inputs) >= 4:
+            values = (
+                applicant.last_name,
+                applicant.first_name,
+                applicant.telephone,
+                password,
+            )
+            for input_index, value in enumerate(values):
+                visible_text_inputs[input_index].fill(value)
+            return
+
+        field_names = [
+            inputs.nth(input_index).get_attribute("name") or ""
+            for input_index in range(inputs.count())
+        ]
+        raise RuntimeError(
+            "取消预约查询页缺少可识别的姓名/电话/password 字段; "
+            f"当前 input name: {field_names}"
+        )
+
+    def submit_cancel_query_form(self, page: Page) -> None:
+        submit_button = page.locator(
+            "input[type='submit'][value='Submit'], button:has-text('Submit')"
+        ).first
+        if submit_button.count() == 0:
+            raise RuntimeError("取消预约查询页缺少 Submit 按钮")
+        self.human_pause(0.2, 0.6)
+        with page.expect_navigation(
+            wait_until="networkidle",
+            timeout=self.timeout_seconds * 1000,
+        ):
+            submit_button.click()
+        self.resolve_verification_pages(page, "submitting cancel query form")
+
+    def print_unknown_bubble_page(self, page: Page, title: str) -> None:
+        try:
+            body_preview = self.extract_body_preview(page.locator("body").inner_text(), limit=500)
+        except Exception:
+            body_preview = ""
+        print(f"\n{title}")
+        print(f"URL: {page.url}")
+        if body_preview:
+            print(f"页面内容预览: {body_preview}")
+
+    def check_bubble_password_appointment(self) -> None:
+        if not self.is_bubble_enabled():
+            return
+        password = self.booking.bubble.password
+        if not password:
+            self.bubble_password_checked = True
+            return
+
+        print("\nBubble: 检测 booking.bubble.password 对应的预约")
+        context, page = self.ensure_browser_session()
+        try:
+            self.open_cancel_query_page(page)
+            self.fill_cancel_query_form(page, password)
+            self.submit_cancel_query_form(page)
+            snapshot = self.detect_page_snapshot(page)
+
+            if snapshot.state == PageState.APPOINTMENT_DETAIL:
+                details = self.extract_confirmation_details(page)
+                appointment_date = self.appointment_date_from_details(details)
+                if appointment_date is not None:
+                    self.current_appointment_date = appointment_date
+                    self.current_appointment_password = password
+                    self.bubble_password_checked = True
+                    print(f"\nBubble: 已确认当前预约日期 {appointment_date.isoformat()}")
+                    return
+
+                self.print_unknown_bubble_page(page, "Bubble: 预约详情页未解析到 Appointment Date")
+                return
+
+            if snapshot.state == PageState.BAD_SUBMIT_CHANGE:
+                self.current_appointment_date = None
+                self.current_appointment_password = ""
+                self.bubble_password_checked = True
+                print("\nBubble: booking.bubble.password 查询无效, 当前预约状态已清空")
+                return
+
+            self.print_unknown_bubble_page(page, "Bubble: booking.bubble.password 查询结果未知")
+        except BookingConfigError:
+            raise
+        except Exception as exc:
+            print(f"\nBubble: booking.bubble.password 查询失败, 保持未确认状态\n====\n{exc}")
+        finally:
+            self.close_current_page()
+
+    def submit_cancel_appointment_from_detail(self, page: Page) -> None:
+        cancel_button = page.locator(
+            "input[type='submit'][value='Cancel Appointment'], button:has-text('Cancel Appointment')"
+        ).first
+        if cancel_button.count() == 0:
+            raise RuntimeError("预约详情页缺少 Cancel Appointment 按钮")
+        self.human_pause(0.2, 0.6)
+        try:
+            with page.expect_navigation(
+                wait_until="networkidle",
+                timeout=self.timeout_seconds * 1000,
+            ):
+                cancel_button.click()
+            self.resolve_verification_pages(page, "submitting cancel appointment")
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(800)
+            self.resolve_verification_pages(page, "submitting cancel appointment")
+
+    def cancel_current_appointment(self, password: Optional[str] = None) -> None:
+        password_to_use = str(password or self.current_appointment_password or "").strip()
+        if not password_to_use:
+            return
+
+        print("\nBubble: 尝试取消当前预约")
+        context, page = self.ensure_browser_session()
+        try:
+            self.open_cancel_query_page(page)
+            self.fill_cancel_query_form(page, password_to_use)
+            self.submit_cancel_query_form(page)
+            snapshot = self.detect_page_snapshot(page)
+            if snapshot.state == PageState.APPOINTMENT_DETAIL:
+                self.submit_cancel_appointment_from_detail(page)
+                print("\nBubble: 已提交取消预约请求")
+                return
+            self.print_unknown_bubble_page(page, "Bubble: 取消预约查询未进入预约详情页")
+        except Exception as exc:
+            print(f"\nBubble: 取消预约流程失败, 将继续后续预约流程\n====\n{exc}")
+        finally:
+            self.close_current_page()
 
     def has_calendar_controls(self, page: Page) -> bool:
         selectors = (
@@ -2074,30 +2428,41 @@ class PassportAppointmentScraper:
         has_calendar_controls = self.has_calendar_controls(page)
         has_verification_controls = self.has_verification_controls(page)
         has_badsubmit_controls = "badsubmit.asp" in url_lower
+        has_badsubmitchange_controls = "badsubmitchange.asp" in url_lower
         has_cancel_booking_controls = "make_submit_cancel.asp" in url_lower
+
+        has_verification_prompt = self.is_verification_body_text(body_text_lower) or (
+            "make_check_validate.asp" in url_lower and has_verification_controls
+        )
 
         if self.is_retry_text(body_text_lower) and has_retry_controls:
             state = PageState.RETRY
+        elif has_verification_prompt:
+            state = PageState.VERIFICATION
+        elif "make_cancel_detail.asp" in url_lower:
+            state = PageState.APPOINTMENT_DETAIL
+        elif "make_cancel_main.asp" in url_lower:
+            state = PageState.APPOINTMENT_CANCEL_QUERY
+        elif "make_cancel_submit.asp" in url_lower:
+            state = PageState.CANCEL_SUBMIT
         elif "appointment uid:" in body_text_lower and "appointment password:" in body_text_lower:
             state = PageState.CONFIRMATION
         elif has_booking_form:
             state = PageState.BOOKING_FORM
-        elif "default.asp" in url_lower and "appcode=1" in url_lower and "postcode=" in url_lower:
-            state = PageState.CITY_SUBMIT
+        elif "default.asp" in url_lower and "postcode=" in url_lower:
+            state = PageState.APPOINTMENT_SELECTION
         elif "make_calendar.asp" in url_lower or has_calendar_controls:
             state = PageState.CALENDAR
         elif has_service_selection:
             state = PageState.SERVICE_SELECTION
         elif self.is_service_selection_url(url_lower):
             state = PageState.SERVICE_SELECTION_LOADING
-        elif self.is_verification_body_text(body_text_lower) or (
-            "make_check_validate.asp" in url_lower and has_verification_controls
-        ):
-            state = PageState.VERIFICATION
         elif has_cancel_booking_controls:
             state = PageState.CANCEL_BOOKING
         elif has_badsubmit_controls:
             state = PageState.BAD_SUBMIT
+        elif has_badsubmitchange_controls:
+            state = PageState.BAD_SUBMIT_CHANGE
         elif has_expired_id_prompt:
             state = PageState.EXPIRED_ID
         else:
@@ -2239,7 +2604,7 @@ class PassportAppointmentScraper:
 
     def handle_verification_page(self, page: Page) -> Optional[str]:
         captcha_retry_count = 0
-        max_captcha_retries = 10
+        max_captcha_retries = 5
         while self.detect_page_snapshot(page).state == PageState.VERIFICATION:
             self.solve_verification_challenge(page)
             self.submit_verification_page(page)
@@ -2691,6 +3056,64 @@ class PassportAppointmentScraper:
             return max(candidates, key=lambda day: day.date_value)
         return min(candidates, key=lambda day: day.date_value)
 
+    def date_selection_targets_current_appointment(self) -> bool:
+        if self.current_appointment_date is None:
+            return False
+        rules = self.booking.date_selection.rules
+        if not rules:
+            return True
+        return any(rule.matches(self.current_appointment_date) for rule in rules)
+
+    def virtual_current_appointment_day(self) -> Optional[AppointmentDay]:
+        if self.current_appointment_date is None:
+            return None
+        return AppointmentDay(
+            year=self.current_appointment_date.year,
+            month=self.current_appointment_date.month,
+            day=self.current_appointment_date.day,
+            count=None,
+            booking_url=None,
+        )
+
+    def select_bubble_better_day(
+        self,
+        all_days: Sequence[AppointmentDay],
+    ) -> Optional[AppointmentDay]:
+        selected_day = self.select_booking_day(all_days)
+        if self.current_appointment_date is None:
+            return selected_day
+
+        if not all_days:
+            return None
+
+        if self.date_selection_targets_current_appointment():
+            candidates = list(all_days)
+            current_day = self.virtual_current_appointment_day()
+            if current_day is not None and not any(
+                day.date_value == current_day.date_value for day in candidates
+            ):
+                candidates.append(current_day)
+            selected_with_current = self.select_booking_day(candidates)
+            if (
+                selected_with_current is None
+                or selected_with_current.date_value == self.current_appointment_date
+            ):
+                return None
+            selected_day = next(
+                (
+                    day for day in all_days
+                    if day.date_value == selected_with_current.date_value
+                    and day.booking_url
+                ),
+                selected_with_current,
+            )
+
+        if selected_day is None:
+            return None
+        if selected_day.date_value == self.current_appointment_date:
+            return None
+        return selected_day
+
     def extract_time_slots_from_page(self, page: Page) -> List[TimeSlot]:
         slots: List[TimeSlot] = []
         radios = page.locator("input[name='availTimeSlot']")
@@ -3129,6 +3552,22 @@ class PassportAppointmentScraper:
             page.wait_for_timeout(800)
             return False
 
+    def refresh_booking_captcha_if_present(self, page: Page) -> None:
+        reload_button = page.locator(
+            "a.LBD_ReloadLink, a[id$='ReloadLink'], a[title*='Reload the CAPTCHA code']"
+        ).first
+        if reload_button.count() == 0:
+            return
+        try:
+            if not reload_button.is_visible() or not reload_button.is_enabled():
+                return
+            self.human_pause(0.1, 0.3)
+            reload_button.click()
+            page.wait_for_timeout(500)
+            print("\n检测到验证码刷新按钮, 已刷新验证码")
+        except Exception as exc:
+            print(f"\n刷新预约表单验证码失败, 继续原流程\n====\n{exc}")
+
     def extract_confirmation_details(self, page: Page) -> Dict[str, str]:
         details: Dict[str, str] = {}
         rows = page.locator("tr")
@@ -3146,6 +3585,33 @@ class PassportAppointmentScraper:
                 details[label.rstrip(":")] = value
 
         return details
+
+    def detail_value(self, details: Dict[str, str], wanted_label: str) -> str:
+        wanted = normalize_whitespace(wanted_label).rstrip(":").lower()
+        for label, value in details.items():
+            normalized_label = normalize_whitespace(label).rstrip(":").lower()
+            if normalized_label == wanted:
+                return value
+        return ""
+
+    def parse_appointment_detail_date(self, value: str) -> Optional[dt.date]:
+        normalized = normalize_whitespace(value)
+        if not normalized:
+            return None
+        for fmt in ("%A, %B %d, %Y", "%B %d, %Y", "%Y-%m-%d"):
+            try:
+                return dt.datetime.strptime(normalized, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    def appointment_date_from_details(self, details: Dict[str, str]) -> Optional[dt.date]:
+        return self.parse_appointment_detail_date(
+            self.detail_value(details, "Appointment Date")
+        )
+
+    def appointment_password_from_details(self, details: Dict[str, str]) -> str:
+        return self.detail_value(details, "Appointment Password")
 
     def save_screenshot_as_pdf(
         self,
@@ -3217,6 +3683,7 @@ class PassportAppointmentScraper:
         self,
         request_context: CalendarRequestContext,
         available_results: Sequence[MonthAvailability],
+        selected_day: Optional[AppointmentDay] = None,
     ) -> str:
         if not self.booking.enabled:
             self.close_current_page()
@@ -3232,7 +3699,8 @@ class PassportAppointmentScraper:
             self.close_current_page()
             return "wait"
 
-        selected_day = self.select_booking_day(self.all_available_days(available_results))
+        if selected_day is None:
+            selected_day = self.select_booking_day(self.all_available_days(available_results))
         if selected_day is None:
             print("\n未找到符合预约规则的日期")
             self.close_current_page()
@@ -3247,7 +3715,7 @@ class PassportAppointmentScraper:
             page = self.open_booking_page(request_context, selected_day)
             selected_time: Optional[TimeSlot] = None
             captcha_retry_count = 0
-            max_captcha_retries = 10
+            max_captcha_retries = 5
             for _ in range(20):
                 snapshot = self.detect_page_snapshot(page)
 
@@ -3262,6 +3730,7 @@ class PassportAppointmentScraper:
                     continue
 
                 if snapshot.state == PageState.BOOKING_FORM:
+                    self.refresh_booking_captcha_if_present(page)
                     if selected_time is None:
                         time_slots = self.extract_time_slots_from_page(page)
                         selected_time = self.select_time_slot(time_slots)
@@ -3288,12 +3757,25 @@ class PassportAppointmentScraper:
                     details = self.extract_confirmation_details(page)
                     artifact_paths = self.save_confirmation_artifacts(page, details)
                     self.print_confirmation_summary(details, artifact_paths)
+                    if self.is_bubble_enabled():
+                        confirmed_date = self.appointment_date_from_details(details) or selected_day.date_value
+                        confirmed_password = self.appointment_password_from_details(details)
+                        self.current_appointment_date = confirmed_date
+                        self.current_appointment_password = confirmed_password
+                        self.bubble_password_checked = True
+                        print(
+                            f"\nBubble: 新预约已记录, 日期 {confirmed_date.isoformat()}, "
+                            f"password: {confirmed_password}"
+                        )
+                        return "wait"
                     return "exit"
 
                 if snapshot.state == PageState.CANCEL_BOOKING:
                     if self.is_existing_appointment_cancel_text(snapshot.body_text.lower()):
                         print("\n已有预约, 无法新预约, 直接退出程序")
                         self.close_current_page()
+                        if self.is_bubble_enabled():
+                            return "wait"
                         return "exit"
                     print("\n预约表单提交后进入取消预约页, 改为等待")
                     body_preview = self.extract_body_preview(snapshot.body_text)
@@ -3346,12 +3828,51 @@ class PassportAppointmentScraper:
             print(f"\n预约流程失败, 立即重试\n====\n{exc}")
             return "retry"
 
+    def attempt_bubble_booking(
+        self,
+        request_context: CalendarRequestContext,
+        available_results: Sequence[MonthAvailability],
+    ) -> str:
+        all_days = self.all_available_days(available_results)
+        better_day = self.select_bubble_better_day(all_days)
+        if better_day is None:
+            if self.current_appointment_date is None:
+                print("\nBubble: 未发现符合规则的可预约日期")
+            else:
+                print(
+                    "\nBubble: 未发现更优日期, 当前预约日期 "
+                    f"{self.current_appointment_date.isoformat()}"
+                )
+            self.close_current_page()
+            return "wait"
+
+        print(f"\nBubble: 发现更优日期 {better_day.iso_date}")
+
+        if not self.bubble_password_checked:
+            self.check_bubble_password_appointment()
+            if self.bubble_password_checked:
+                return "retry"
+
+        if self.current_appointment_password:
+            self.cancel_current_appointment()
+        elif not self.bubble_password_checked:
+            self.cancel_current_appointment(password=self.booking.bubble.password)
+
+        return self.attempt_booking(
+            request_context=request_context,
+            available_results=available_results,
+            selected_day=better_day,
+        )
+
     def check_once(self) -> str:
         now = dt.datetime.now().astimezone()
         print(f"\n当前时间: {now.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
         directive = "wait"
         self.begin_check_once_window()
         try:
+            if self.is_bubble_enabled() and not self.bubble_password_checked:
+                self.check_bubble_password_appointment()
+
             try:
                 self.ensure_check_once_within_timeout()
                 cached_request_context = self.current_cached_request_context()
@@ -3392,7 +3913,10 @@ class PassportAppointmentScraper:
                     self.save_available_date_records(request_context, available_results)
                 except Exception as exc:
                     print(f"\n保存可预约日期记录失败\n====\n{exc}")
-                directive = self.attempt_booking(request_context, available_results)
+                if self.is_bubble_enabled():
+                    directive = self.attempt_bubble_booking(request_context, available_results)
+                else:
+                    directive = self.attempt_booking(request_context, available_results)
                 return directive
 
             self.print_check_summary(
@@ -3418,6 +3942,7 @@ class PassportAppointmentScraper:
                 {
                     "directive": directive,
                     "context_cache": scraper.current_context_cache_payload(),
+                    "bubble_state": scraper.current_bubble_state_payload(),
                 }
             )
         except Exception as exc:
@@ -3426,6 +3951,7 @@ class PassportAppointmentScraper:
                 {
                     "directive": "wait",
                     "context_cache": scraper.current_context_cache_payload(),
+                    "bubble_state": scraper.current_bubble_state_payload(),
                 }
             )
 
@@ -3467,6 +3993,9 @@ class PassportAppointmentScraper:
                 cache_payload = result.get("context_cache")
                 if isinstance(cache_payload, dict):
                     self.apply_context_cache_payload(cache_payload)
+                bubble_payload = result.get("bubble_state")
+                if isinstance(bubble_payload, dict):
+                    self.apply_bubble_state_payload(bubble_payload)
                 directive_candidate = str(result.get("directive", "wait"))
                 if directive_candidate in {"wait", "retry", "exit"}:
                     directive = directive_candidate
