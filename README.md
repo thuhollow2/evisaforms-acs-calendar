@@ -31,7 +31,7 @@ python main.py
 {
   "city": "BEIJING",
   "months": ["+0", "+1"],
-  "service_index": 3,
+  "service_index": 1,
   "show_browser": false,
   "timeout_seconds": 30,
   "check_once_max_seconds": 180,
@@ -39,37 +39,34 @@ python main.py
   "booking": {
     "enabled": false,
     "date_selection": {
-      "targets": [
-        "2026-05-05",
-        "2026-05-07",
-        "2026-05-15"
-      ],
-      "filter_mode": "weight",
-      "weights": [
-        1,
-        5,
-        3
-      ],
+      "targets": [],
+      "filter_mode": "none",
+      "weights": [],
       "final_pick": "earliest"
     },
     "time_selection": {
-      "filter_mode": "max_available",
-      "final_pick": "earliest"
+      "filter_mode": "none",
+      "final_pick": "latest"
     },
     "applicant": {
-      "last_name": "ZHANG",
-      "first_name": "SAN",
-      "date_of_birth": "1990-01-01",
-      "telephone": "13800138000",
+      "last_name": "SAN",
+      "first_name": "TAN",
+      "date_of_birth": "2000-01-01",
+      "telephone": "12345678",
       "email": "example@example.com",
       "citizenship": "SINGAPORE",
       "birth_country": "SINGAPORE",
       "sex": "M",
       "passport_number": "E12345678",
       "non_applicant_names": [
-        "LI SI",
-        "WANG WU"
+        "WANG WU",
+        "WANG LU",
+        "WANG ZU"
       ]
+    },
+    "bubble": {
+      "enabled": false,
+      "password": "XXXXXXXXXX"
     }
   }
 }
@@ -342,7 +339,7 @@ python main.py
   </details>
 
 - `months`: +非负整数, 表示相对月份, 例如 `["+0", "+1", "+2"]`, 以初始日历页面时上的月份作为基准推算
-- `service_index` / `service_indexs`: 服务选择页中的第几个服务, 从 `1` 开始. `service_index` 仅用于单选情况, 输入为单个数字; `service_indexs` 用于可多选情况, 例如 `[1, 3]` 表示选择第 1 和第 3 个服务. 请根据具体城市的服务选择页确定使用哪个参数, 不要同时使用两个参数
+- `service_index` / `service_indexs`: 服务选择页中的第几个服务, 从 `1` 开始. `service_index` 仅用于单选情况, 输入为单个数字; `service_indexs` 用于可多选情况, 例如 `[1, 3]` 表示选择第 1 个和第 3 个服务. 不得同时使用两个参数. 参数并非随意指定, 必须根据具体城市的服务选择页确定
 - `show_browser`: 是否显示浏览器
 - `timeout_seconds`: 页面超时时间, 单位秒
 - `check_once_max_seconds`: 单次查询最大运行秒数, 超时会强制中止并等待下一次执行
@@ -918,9 +915,35 @@ python main.py
 
 如果这些字段不完整或错误, 脚本会打印错误并等待下一次轮询, 不会继续提交
 
+### Bubble 预约
+
+`booking.bubble` 用于已有预约或未预约时自动改约到更优日期
+
+- `enabled`
+  - `true`: 开启 Bubble 模式
+  - `false`: 关闭 Bubble 模式
+- `password`
+  - 当前预约的密码
+  - 同城市同信息系统只允许同时预约一次, 如有预约请填写, 否则留空, 脚本会用它查询并取消当前预约后再新预约
+
+Bubble 实际生效需要同时满足:
+
+- `booking.enabled = true`
+- `booking.bubble.enabled = true`
+- `booking.date_selection.filter_mode` 只能是 `none` 或 `weight`
+
+执行逻辑:
+
+1. 如果尚未确认当前预约且已配置 `booking.bubble.password`, 脚本会先进入取消预约查询页, 使用 `last_name`、`first_name`、`telephone`、`password` 查询当前预约日期
+2. 按 `booking.date_selection` 规则判断是否存在更优日期
+3. 如果没有更优日期, 本轮不提交预约, 等待下一次轮询
+4. 如果有更优日期, 且拿到了当前预约密码, 会先取消当前预约, 再发起新预约
+5. 新预约成功后, 脚本会记录新的预约日期与密码, 供后续轮询继续比较
+6. Bubble 模式下, 程序不会主动停止, `interval_minutes` 非 0 时会一直轮询, 请谨慎使用
+
 ## 自动预约执行逻辑
 
-1. 获取会话 Cookie 和 `CSRFToken`
+1. 获取会话 `cookie` 和 `CSRFToken`
 2. 查询指定月份的日历
 3. 打印地点, 服务, 月份, 可预约日期
 4. 如果 `booking.enabled = true`, 按规则选出预约日期
