@@ -1,11 +1,11 @@
 {
   "city": "BEIJING",
-  "months": ["+0", "+1", "+2"],
+  "months": ["+0", "+1"],
   "service_index": 1,
   "show_browser": false,
   "timeout_seconds": 30,
   "check_once_max_seconds": 180,
-  "interval_minutes": 1,
+  "interval_minutes": 0,
   "booking": {
     "enabled": false,
     "date_selection": {
@@ -22,18 +22,21 @@
       "last_name": "SAN",
       "first_name": "TAN",
       "date_of_birth": "2000-01-01",
-      "telephone": "1393000",
-      "email": "e@gmail.com",
+      "telephone": "12345678",
+      "email": "example@example.com",
       "citizenship": "SINGAPORE",
       "birth_country": "SINGAPORE",
       "sex": "M",
-      "passport_number": "E15645678",
+      "passport_number": "E12345678",
       "non_applicant_names": [
-        "LI SI",
         "WANG WU",
         "WANG LU",
         "WANG ZU"
       ]
+    },
+    "bubble": {
+      "enabled": false,
+      "password": "XXXXXXXXXX"
     }
   }
 }
